@@ -65,6 +65,14 @@
       <HintPath>$(Il2CppAssembliesDir)\Il2CppSystem.Core.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="Il2CppFunselektor.FunCore.Runtime">
+      <HintPath>$(Il2CppAssembliesDir)\Il2CppFunselektor.FunCore.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.TextMeshPro">
+      <HintPath>$(Il2CppAssembliesDir)\Unity.TextMeshPro.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
   <!-- Automatically copy built DLL to game's Mods directory if found -->

@@ -5,7 +5,7 @@ using UnityEngine;
 using Il2Cpp;
 using Il2CppFusion;
 
-[assembly: MelonInfo(typeof(OverTheHillExpandedLobbies.ExpandedLobbiesMod), "Expanded Lobbies", "1.0.0", "Daniel Winn")]
+[assembly: MelonInfo(typeof(OverTheHillExpandedLobbies.ExpandedLobbiesMod), "Expanded Lobbies", "1.0.1", "Daniel Winn")]
 [assembly: MelonGame("Funselektor", "over the hill")]
 
 namespace OverTheHillExpandedLobbies
@@ -15,19 +15,21 @@ namespace OverTheHillExpandedLobbies
         public override void OnInitializeMelon()
         {
             LoggerInstance.Msg("==========================================================");
-            LoggerInstance.Msg(" Over The Hill: Expanded Lobbies Mod Loaded!              ");
-            LoggerInstance.Msg(" Max player limit selectable up to 16 players.            ");
+            LoggerInstance.Msg(" Over The Hill: Expanded Lobbies Mod Loaded! (v1.0.1)     ");
+            LoggerInstance.Msg(" Player limit selectable from 2 to 16 in single steps.    ");
             LoggerInstance.Msg("==========================================================");
         }
     }
 
     /// <summary>
-    /// Injects custom lobby size options into the Create Server UI dropdown,
-    /// marking 8+ player options with an '(Unstable)' warning tag.
+    /// Injects custom player limits (2 through 16 in steps of 1) into Create Server UI.
+    /// Keeps options as pure integer strings so vanilla int.Parse succeeds without FormatException.
     /// </summary>
     [HarmonyPatch(typeof(ContextUICreateServer), nameof(ContextUICreateServer.Start))]
     public static class ContextUICreateServer_Start_Patch
     {
+        public static CarouselOption MaxPlayersCarousel { get; private set; }
+
         public static void Postfix(ContextUICreateServer __instance)
         {
             try
@@ -35,16 +37,16 @@ namespace OverTheHillExpandedLobbies
                 if (__instance == null || __instance.MaxPlayersOptionSelector == null)
                     return;
 
-                MelonLogger.Msg("[ExpandedLobbies] Injecting custom player limits into Create Server UI...");
+                MelonLogger.Msg("[ExpandedLobbies] Injecting custom player limits (2-16) into Create Server UI...");
                 var customOptions = new Il2CppSystem.Collections.Generic.List<string>();
-                string[] values = new string[] { "2", "3", "4", "6", "8 (Unstable)", "10 (Unstable)", "12 (Unstable)", "16 (Unstable)" };
-                foreach (var v in values)
+                for (int i = 2; i <= 16; i++)
                 {
-                    customOptions.Add(v);
+                    customOptions.Add(i.ToString());
                 }
 
                 __instance.maxPlayersOptionsRange = customOptions;
-                __instance.MaxPlayersOptionSelector.Initialize(customOptions, 2); // Default to "4" (index 2)
+                __instance.MaxPlayersOptionSelector.Initialize(customOptions, 2); // Default to index 2 ("4")
+                MaxPlayersCarousel = __instance.MaxPlayersOptionSelector.CarouselOption;
             }
             catch (Exception ex)
             {
@@ -54,72 +56,59 @@ namespace OverTheHillExpandedLobbies
     }
 
     /// <summary>
-    /// Sanitizes player limit text before vanilla parsing (e.g. "8 (Unstable)" -> "8")
-    /// and ensures GameSetupContext.MaxPlayers receives the intended integer.
+    /// When the player selector carousel updates its display, append '(Unstable)' if player count >= 8.
+    /// This gives visual feedback in the UI without modifying the underlying option string.
     /// </summary>
-    [HarmonyPatch(typeof(ContextUICreateServer), nameof(ContextUICreateServer.SetGameSetupContextValues))]
-    public static class ContextUICreateServer_SetGameSetupContextValues_Patch
+    [HarmonyPatch(typeof(CarouselOption), nameof(CarouselOption.InternalSelected))]
+    public static class CarouselOption_InternalSelected_Patch
     {
-        private static string _savedOptionText = null;
-        private static int _savedIndex = -1;
-
-        public static void Prefix(ContextUICreateServer __instance, ref GameSetupContext gameSetupContext)
+        public static void Postfix(CarouselOption __instance)
         {
             try
             {
-                if (__instance != null && __instance.maxPlayersOptionsRange != null)
+                if (__instance != null && __instance.Option != null && __instance == ContextUICreateServer_Start_Patch.MaxPlayersCarousel)
                 {
-                    int selectedIdx = __instance.maxPlayersOptionsSelectedIndex;
-                    if (selectedIdx >= 0 && selectedIdx < __instance.maxPlayersOptionsRange.Count)
+                    string selected = __instance.GetSelectedOption();
+                    if (int.TryParse(selected, out int count) && count >= 8)
                     {
-                        string optionStr = __instance.maxPlayersOptionsRange[selectedIdx];
-                        if (optionStr != null && optionStr.Contains(" "))
-                        {
-                            _savedOptionText = optionStr;
-                            _savedIndex = selectedIdx;
-                            __instance.maxPlayersOptionsRange[selectedIdx] = optionStr.Split(' ')[0];
-                        }
+                        __instance.Option.text = $"{count} (Unstable)";
                     }
                 }
             }
             catch (Exception ex)
             {
-                MelonLogger.Error($"[ExpandedLobbies] Error in SetGameSetupContextValues Prefix: {ex}");
+                MelonLogger.Error($"[ExpandedLobbies] Error in CarouselOption.InternalSelected patch: {ex}");
             }
         }
+    }
 
-        public static void Postfix(ContextUICreateServer __instance, ref GameSetupContext gameSetupContext)
+    /// <summary>
+    /// Also hook OnMaxPlayersChanged callback to ensure the '(Unstable)' tag updates immediately
+    /// whenever the host navigates left or right.
+    /// </summary>
+    [HarmonyPatch(typeof(ContextUICreateServer), nameof(ContextUICreateServer.OnMaxPlayersChanged))]
+    public static class ContextUICreateServer_OnMaxPlayersChanged_Patch
+    {
+        public static void Postfix(ContextUICreateServer __instance, int option)
         {
             try
             {
-                // Restore display text in UI list
-                if (_savedOptionText != null && _savedIndex >= 0 && __instance?.maxPlayersOptionsRange != null)
-                {
-                    __instance.maxPlayersOptionsRange[_savedIndex] = _savedOptionText;
-                    _savedOptionText = null;
-                    _savedIndex = -1;
-                }
-
-                if (gameSetupContext != null && __instance != null)
+                if (__instance?.MaxPlayersOptionSelector?.CarouselOption?.Option != null)
                 {
                     var options = __instance.maxPlayersOptionsRange;
-                    int selectedIdx = __instance.maxPlayersOptionsSelectedIndex;
-
-                    if (options != null && selectedIdx >= 0 && selectedIdx < options.Count)
+                    if (options != null && option >= 0 && option < options.Count)
                     {
-                        string selectedStr = options[selectedIdx];
-                        string numStr = selectedStr.Split(' ')[0];
-                        if (int.TryParse(numStr, out int limit))
+                        string selected = options[option];
+                        if (int.TryParse(selected, out int count) && count >= 8)
                         {
-                            gameSetupContext.MaxPlayers = limit;
-                            MelonLogger.Msg($"[ExpandedLobbies] Host configured room with MaxPlayers = {limit}");
+                            __instance.MaxPlayersOptionSelector.CarouselOption.Option.text = $"{count} (Unstable)";
                         }
                     }
                 }
             }
             catch (Exception ex)
             {
-                MelonLogger.Error($"[ExpandedLobbies] Error in SetGameSetupContextValues Postfix: {ex}");
+                MelonLogger.Error($"[ExpandedLobbies] Error in OnMaxPlayersChanged patch: {ex}");
             }
         }
     }
