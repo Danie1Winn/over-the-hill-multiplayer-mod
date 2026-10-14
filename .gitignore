@@ -21,3 +21,8 @@ Mods/
 Logs/
 *.dll
 *.pdb
+
+## Release archives
+*.zip
+release*/
+dist/
