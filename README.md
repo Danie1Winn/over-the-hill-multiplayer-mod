@@ -25,6 +25,7 @@ A MelonLoader mod for **Over the Hill** (by Funselektor) that expands multiplaye
    <SteamLibrary>\steamapps\common\over the hill\Mods\OverTheHillExpandedLobbies.dll
    ```
 3. Launch the game through Steam as normal.
+*Note: All players in the lobby should have the mod installed*
 
 ---
 
