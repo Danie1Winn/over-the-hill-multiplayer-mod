@@ -78,6 +78,6 @@
   <!-- Automatically copy built DLL to game's Mods directory if found -->
   <Target Name="CopyToMods" AfterTargets="Build" Condition="Exists('$(GameDir)\Mods')">
     <Message Importance="High" Text="[ExpandedLobbies] Copying $(TargetPath) to $(GameDir)\Mods..." />
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(GameDir)\Mods" SkipUnchangedFiles="false" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(GameDir)\Mods" SkipUnchangedFiles="false" ContinueOnError="true" Retries="1" RetryDelayMilliseconds="500" />
   </Target>
 </Project>

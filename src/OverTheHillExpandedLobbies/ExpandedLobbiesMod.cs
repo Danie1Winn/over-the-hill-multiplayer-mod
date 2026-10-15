@@ -5,7 +5,7 @@ using UnityEngine;
 using Il2Cpp;
 using Il2CppFusion;
 
-[assembly: MelonInfo(typeof(OverTheHillExpandedLobbies.ExpandedLobbiesMod), "Expanded Lobbies", "1.0.1", "Daniel Winn")]
+[assembly: MelonInfo(typeof(OverTheHillExpandedLobbies.ExpandedLobbiesMod), "Expanded Lobbies", "1.0.2", "Daniel Winn")]
 [assembly: MelonGame("Funselektor", "over the hill")]
 
 namespace OverTheHillExpandedLobbies
@@ -15,7 +15,7 @@ namespace OverTheHillExpandedLobbies
         public override void OnInitializeMelon()
         {
             LoggerInstance.Msg("==========================================================");
-            LoggerInstance.Msg(" Over The Hill: Expanded Lobbies Mod Loaded! (v1.0.1)     ");
+            LoggerInstance.Msg(" Over The Hill: Expanded Lobbies Mod Loaded! (v1.0.2)     ");
             LoggerInstance.Msg(" Player limit selectable from 2 to 16 in single steps.    ");
             LoggerInstance.Msg("==========================================================");
         }
@@ -83,7 +83,7 @@ namespace OverTheHillExpandedLobbies
     }
 
     /// <summary>
-    /// Also hook OnMaxPlayersChanged callback to ensure the '(Unstable)' tag updates immediately
+    /// Hook OnMaxPlayersChanged callback to ensure the '(Unstable)' tag updates immediately
     /// whenever the host navigates left or right.
     /// </summary>
     [HarmonyPatch(typeof(ContextUICreateServer), nameof(ContextUICreateServer.OnMaxPlayersChanged))]
@@ -109,6 +109,62 @@ namespace OverTheHillExpandedLobbies
             catch (Exception ex)
             {
                 MelonLogger.Error($"[ExpandedLobbies] Error in OnMaxPlayersChanged patch: {ex}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Fixes the hardcoded vanilla clamp min(MaxPlayers, 4) in StartGameArgs.
+    /// When the host creates a session, this overrides StartGameArgs.PlayerCount with the
+    /// chosen MaxPlayers value so Photon Fusion actually hosts an expanded room.
+    /// </summary>
+    [HarmonyPatch(typeof(NetworkRunner), nameof(NetworkRunner.StartGame))]
+    public static class NetworkRunner_StartGame_Patch
+    {
+        public static void Prefix(NetworkRunner __instance, ref StartGameArgs args)
+        {
+            try
+            {
+                if (OverlandNetworkRunner.Instance != null && OverlandNetworkRunner.Instance.GameSetupContext != null)
+                {
+                    int maxPlayers = OverlandNetworkRunner.Instance.GameSetupContext.MaxPlayers;
+                    if (maxPlayers > 4)
+                    {
+                        MelonLogger.Msg($"[ExpandedLobbies] Host creating room: Overriding Photon StartGameArgs.PlayerCount to {maxPlayers}!");
+                        args.PlayerCount = new Il2CppSystem.Nullable<int>(maxPlayers);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Error($"[ExpandedLobbies] Error in NetworkRunner.StartGame patch: {ex}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Fixes the client-side 'Game Is Full' popup in StateServerBrowser.JoinSession.
+    /// Vanilla compares session.FusionSessionInfo.PlayerCount >= session.FusionSessionInfo.MaxPlayers.
+    /// This ensures clients never block joining when connecting to expanded lobbies.
+    /// </summary>
+    [HarmonyPatch(typeof(StateServerBrowser), nameof(StateServerBrowser.JoinSession))]
+    public static class StateServerBrowser_JoinSession_Patch
+    {
+        public static void Prefix(StateServerBrowser __instance, OverlandSessionInfo sessionToJoin, bool joiningByCode)
+        {
+            try
+            {
+                if (sessionToJoin?.FusionSessionInfo != null)
+                {
+                    if (sessionToJoin.FusionSessionInfo.MaxPlayers < 16)
+                    {
+                        sessionToJoin.FusionSessionInfo.MaxPlayers = 16;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Error($"[ExpandedLobbies] Error in StateServerBrowser.JoinSession patch: {ex}");
             }
         }
     }
