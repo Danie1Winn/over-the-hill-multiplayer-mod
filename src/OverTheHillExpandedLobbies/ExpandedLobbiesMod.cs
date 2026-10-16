@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using MelonLoader;
 using HarmonyLib;
@@ -6,7 +7,7 @@ using UnityEngine;
 using Il2Cpp;
 using Il2CppFusion;
 
-[assembly: MelonInfo(typeof(OverTheHillExpandedLobbies.ExpandedLobbiesMod), "Expanded Lobbies", "1.0.3", "Daniel Winn")]
+[assembly: MelonInfo(typeof(OverTheHillExpandedLobbies.ExpandedLobbiesMod), "Expanded Lobbies", "1.0.4", "Daniel Winn")]
 [assembly: MelonGame("Funselektor", "over the hill")]
 
 namespace OverTheHillExpandedLobbies
@@ -16,7 +17,7 @@ namespace OverTheHillExpandedLobbies
         public override void OnInitializeMelon()
         {
             LoggerInstance.Msg("==========================================================");
-            LoggerInstance.Msg(" Over The Hill: Expanded Lobbies Mod Loaded! (v1.0.3)     ");
+            LoggerInstance.Msg(" Over The Hill: Expanded Lobbies Mod Loaded! (v1.0.4)     ");
             LoggerInstance.Msg(" Player limit selectable from 2 to 16 in single steps.    ");
             LoggerInstance.Msg("==========================================================");
 
@@ -166,7 +167,6 @@ namespace OverTheHillExpandedLobbies
                 short optHdrSize = *(short*)(basePtr + peOffset + 20);
                 byte* sectPtr = basePtr + peOffset + 24 + optHdrSize;
 
-                // Search inside executable sections (e.g. .text and il2cpp)
                 for (int s = 0; s < numSections; s++)
                 {
                     byte* sec = sectPtr + (s * 40);
@@ -174,7 +174,6 @@ namespace OverTheHillExpandedLobbies
                     uint virtAddr = *(uint*)(sec + 12);
                     uint characteristics = *(uint*)(sec + 36);
 
-                    // Check for IMAGE_SCN_MEM_EXECUTE (0x20000000)
                     if ((characteristics & 0x20000000) != 0 && virtSize > pattern.Length)
                     {
                         byte* start = basePtr + virtAddr;
@@ -205,6 +204,266 @@ namespace OverTheHillExpandedLobbies
                 MelonLogger.Error($"[ExpandedLobbies] Pattern scan exception: {ex.Message}");
             }
             return IntPtr.Zero;
+        }
+    }
+
+    /// <summary>
+    /// Helper for managing up to 16 player slots, UI indicators, and colors across MapView, Compass, and Session.
+    /// Vanilla OrderedPlayerRefs and PlayerColors are weaved Photon Fusion NetworkArrays of fixed capacity 4.
+    /// Slots 0..3 mirror OrderedPlayerRefs[0..3], while slots 4..15 deterministically assign 5th-16th players.
+    /// </summary>
+    internal static class ExpandedPlayerHelper
+    {
+        public const int MaxExpandedPlayers = 16;
+
+        public static readonly Dictionary<int, string> CachedPlayerNames = new Dictionary<int, string>();
+
+        // 12 distinct, vibrant colors for players 5 through 16
+        private static readonly Color[] ExtraPlayerColors = new Color[]
+        {
+            new Color(0.00f, 0.85f, 0.95f, 1f), // 5: Cyan
+            new Color(1.00f, 0.55f, 0.10f, 1f), // 6: Orange
+            new Color(0.95f, 0.25f, 0.80f, 1f), // 7: Magenta / Pink
+            new Color(0.55f, 0.95f, 0.20f, 1f), // 8: Lime Green
+            new Color(0.25f, 0.55f, 1.00f, 1f), // 9: Royal Blue
+            new Color(1.00f, 0.75f, 0.20f, 1f), // 10: Gold / Amber
+            new Color(1.00f, 0.40f, 0.45f, 1f), // 11: Coral
+            new Color(0.20f, 0.95f, 0.65f, 1f), // 12: Mint
+            new Color(0.65f, 0.40f, 1.00f, 1f), // 13: Lavender / Violet
+            new Color(0.90f, 0.95f, 0.45f, 1f), // 14: Chartreuse
+            new Color(0.00f, 0.65f, 0.65f, 1f), // 15: Teal
+            new Color(0.95f, 0.50f, 0.70f, 1f), // 16: Rose
+        };
+
+        public static Color GetExtraPlayerColor(PlayerRef playerRef, int slotIndex)
+        {
+            int idx = slotIndex >= 4 ? (slotIndex - 4) : Math.Abs(playerRef.PlayerId);
+            return ExtraPlayerColors[idx % ExtraPlayerColors.Length];
+        }
+
+        /// <summary>
+        /// Returns a deterministic 16-element array of PlayerRefs:
+        /// - Indices 0..3 match OverlandSessionPlayers.Instance.OrderedPlayerRefs[0..3].
+        /// - Indices 4..15 contain any additional active players in ascending PlayerId order.
+        /// </summary>
+        public static PlayerRef[] GetOrderedPlayerSlots()
+        {
+            PlayerRef[] slots = new PlayerRef[MaxExpandedPlayers];
+            for (int i = 0; i < MaxExpandedPlayers; i++)
+            {
+                slots[i] = PlayerRef.None;
+            }
+
+            var sessionPlayers = OverlandSessionPlayers.Instance;
+            if (sessionPlayers == null || sessionPlayers.Object == null)
+                return slots;
+
+            try
+            {
+                var ordered = sessionPlayers.OrderedPlayerRefs;
+                int baseLen = Math.Min(ordered.Length, 4);
+                for (int i = 0; i < baseLen; i++)
+                {
+                    slots[i] = ordered[i];
+                }
+            }
+            catch
+            {
+                // Ignore if network state is not yet ready
+            }
+
+            var runnerInstance = OverlandNetworkRunner.Instance;
+            var netRunner = runnerInstance != null ? runnerInstance.NetworkRunner : null;
+            var mapNet = MapNetworkManager.Instance;
+            PlayerRef localPlayer = OverlandNetworkRunner.LocalPlayerRef;
+
+            int nextSlot = 4;
+            // Scan candidate PlayerRefs by index (0..31) in deterministic order
+            for (int idx = 0; idx < 32 && nextSlot < MaxExpandedPlayers; idx++)
+            {
+                PlayerRef candidate = PlayerRef.FromIndex(idx);
+                if (candidate == PlayerRef.None)
+                    continue;
+
+                // Skip if already in slots 0..3
+                bool alreadyAssigned = false;
+                for (int j = 0; j < 4; j++)
+                {
+                    if (slots[j] == candidate)
+                    {
+                        alreadyAssigned = true;
+                        break;
+                    }
+                }
+                if (alreadyAssigned)
+                    continue;
+
+                bool isActive = false;
+
+                // Check 1: Is it the local player?
+                if (localPlayer != PlayerRef.None && candidate == localPlayer)
+                {
+                    isActive = true;
+                }
+
+                // Check 2: Does NetworkRunner have a spawned player object for this PlayerRef?
+                if (!isActive && netRunner != null)
+                {
+                    try
+                    {
+                        if (netRunner.TryGetPlayerObject(candidate, out NetworkObject playerObj) && playerObj != null)
+                        {
+                            isActive = true;
+                        }
+                    }
+                    catch { }
+                }
+
+                // Check 3: Is this player in OverlandSessionPlayers.PlayerRefToNameDictionary?
+                if (!isActive)
+                {
+                    try
+                    {
+                        if (sessionPlayers.PlayerRefToNameDictionary.ContainsKey(candidate.PlayerId))
+                        {
+                            isActive = true;
+                        }
+                    }
+                    catch { }
+                }
+
+                // Check 4: Does MapNetworkManager have a pinpoint for this player?
+                if (!isActive && mapNet != null && mapNet.Object != null)
+                {
+                    try
+                    {
+                        if (mapNet.PlayerRefToPinpointPosition.ContainsKey(candidate))
+                        {
+                            isActive = true;
+                        }
+                    }
+                    catch { }
+                }
+
+                if (isActive)
+                {
+                    slots[nextSlot++] = candidate;
+                }
+            }
+
+            return slots;
+        }
+
+        public static int GetPlayerSlotIndex(PlayerRef playerRef)
+        {
+            if (playerRef == PlayerRef.None)
+                return -1;
+
+            PlayerRef[] slots = GetOrderedPlayerSlots();
+            for (int i = 0; i < slots.Length; i++)
+            {
+                if (slots[i] == playerRef)
+                    return i;
+            }
+            return -1;
+        }
+
+        /// <summary>
+        /// Dynamically clones MapView's playerIndicators and pinpointIndicators from 4 up to 16,
+        /// and keeps pinpointIndicatorsRectTransforms synchronized with all 16 PinpointMapIcons.
+        /// </summary>
+        public static void EnsureExpandedMapIndicators(MapView mapView)
+        {
+            if (mapView == null)
+                return;
+
+            try
+            {
+                // 1. Expand playerIndicators (List<MapPlayerImage>) to 16
+                var playerIndicators = mapView.playerIndicators;
+                if (playerIndicators != null && playerIndicators.Count > 0 && playerIndicators.Count < MaxExpandedPlayers)
+                {
+                    MapPlayerImage template = playerIndicators[0];
+                    if (template != null)
+                    {
+                        GameObject templateRoot = template.MovingParent != null ? template.MovingParent.gameObject : template.gameObject;
+                        Transform parentTransform = templateRoot.transform.parent;
+
+                        while (playerIndicators.Count < MaxExpandedPlayers)
+                        {
+                            int newIdx = playerIndicators.Count;
+                            GameObject cloneObj = UnityEngine.Object.Instantiate(templateRoot, parentTransform);
+                            cloneObj.name = $"{templateRoot.name}_Expanded_{newIdx + 1}";
+                            cloneObj.SetActive(false);
+
+                            MapPlayerImage cloneImg = cloneObj.GetComponentInChildren<MapPlayerImage>(true);
+                            if (cloneImg != null)
+                            {
+                                playerIndicators.Add(cloneImg);
+                            }
+                            else
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 2. Expand pinpointIndicators (List<PinpointMapIcon>) to 16
+                var pinpointIndicators = mapView.pinpointIndicators;
+                bool clonedPinpoints = false;
+                if (pinpointIndicators != null && pinpointIndicators.Count > 0 && pinpointIndicators.Count < MaxExpandedPlayers)
+                {
+                    PinpointMapIcon pinTemplate = pinpointIndicators[0];
+                    if (pinTemplate != null)
+                    {
+                        GameObject templateObj = pinTemplate.gameObject;
+                        Transform parentTransform = templateObj.transform.parent;
+
+                        while (pinpointIndicators.Count < MaxExpandedPlayers)
+                        {
+                            int newIdx = pinpointIndicators.Count;
+                            GameObject cloneObj = UnityEngine.Object.Instantiate(templateObj, parentTransform);
+                            cloneObj.name = $"{templateObj.name}_Expanded_{newIdx + 1}";
+                            cloneObj.SetActive(false);
+
+                            PinpointMapIcon clonePin = cloneObj.GetComponent<PinpointMapIcon>();
+                            if (clonePin != null)
+                            {
+                                pinpointIndicators.Add(clonePin);
+                                clonedPinpoints = true;
+                            }
+                            else
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 3. Ensure pinpointIndicatorsRectTransforms has all 16 RectTransforms
+                // (Note: MapView.DelayedEnable recreates pinpointIndicatorsRectTransforms with only 4 items on each OnEnable)
+                var rectTransforms = mapView.pinpointIndicatorsRectTransforms;
+                if (rectTransforms != null && pinpointIndicators != null && rectTransforms.Count < pinpointIndicators.Count)
+                {
+                    for (int i = rectTransforms.Count; i < pinpointIndicators.Count; i++)
+                    {
+                        PinpointMapIcon pin = pinpointIndicators[i];
+                        RectTransform rt = pin != null ? pin.GetComponent<RectTransform>() : null;
+                        rectTransforms.Add(rt);
+                    }
+                }
+
+                // 4. Rebuild cursor snap targets if new pinpoint icons were instantiated
+                if (clonedPinpoints && mapView.mapCursorSnapper != null)
+                {
+                    mapView.mapCursorSnapper.RebuildTargets();
+                }
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Error($"[ExpandedLobbies] Error in EnsureExpandedMapIndicators: {ex}");
+            }
         }
     }
 
@@ -341,8 +600,12 @@ namespace OverTheHillExpandedLobbies
                 var points = __instance?.spawnPoints;
                 if (points != null && points.Count > 0)
                 {
-                    int rawIndex = playerRef.RawEncoded;
-                    spawnPointIndex = Math.Abs(rawIndex) % points.Count;
+                    int slotIdx = ExpandedPlayerHelper.GetPlayerSlotIndex(playerRef);
+                    if (slotIdx < 0)
+                    {
+                        slotIdx = Math.Abs(playerRef.PlayerId);
+                    }
+                    spawnPointIndex = slotIdx % points.Count;
                     __result = points[spawnPointIndex];
                     return false; // Skip vanilla method
                 }
@@ -358,19 +621,451 @@ namespace OverTheHillExpandedLobbies
     }
 
     /// <summary>
-    /// Guards OverlandSessionPlayers.AddPlayer against IndexOutOfRangeException or
-    /// AssertException (NetworkArray / NetworkDictionary capacity limits) when 8+ players connect.
+    /// Assigns distinct colors to players 5..16 who are not in the 4-element OverlandSessionPlayers.PlayerColors array.
+    /// </summary>
+    [HarmonyPatch(typeof(UIManager), nameof(UIManager.GetPlayerColor))]
+    public static class UIManager_GetPlayerColor_Patch
+    {
+        public static void Postfix(PlayerRef playerRef, ref Color __result)
+        {
+            try
+            {
+                if (playerRef == PlayerRef.None)
+                    return;
+
+                var sessionPlayers = OverlandSessionPlayers.Instance;
+                if (sessionPlayers != null && sessionPlayers.Object != null)
+                {
+                    var colors = sessionPlayers.PlayerColors;
+                    bool inBaseColors = false;
+                    int len = Math.Min(colors.Length, 4);
+                    for (int i = 0; i < len; i++)
+                    {
+                        if (colors[i] == playerRef)
+                        {
+                            inBaseColors = true;
+                            break;
+                        }
+                    }
+
+                    if (!inBaseColors)
+                    {
+                        int slotIdx = ExpandedPlayerHelper.GetPlayerSlotIndex(playerRef);
+                        __result = ExpandedPlayerHelper.GetExtraPlayerColor(playerRef, slotIdx);
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore if network state is not ready
+            }
+        }
+    }
+
+    /// <summary>
+    /// Updates MapView player names and pinpoint icon colors/labels for up to 16 players.
+    /// </summary>
+    [HarmonyPatch(typeof(MapView), nameof(MapView.SetupPlayerNames))]
+    public static class MapView_SetupPlayerNames_Patch
+    {
+        public static bool Prefix(MapView __instance)
+        {
+            try
+            {
+                if (__instance == null || OverlandSessionPlayers.Instance == null || OverlandSessionPlayers.Instance.Object == null)
+                    return false;
+
+                ExpandedPlayerHelper.EnsureExpandedMapIndicators(__instance);
+
+                PlayerRef[] slots = ExpandedPlayerHelper.GetOrderedPlayerSlots();
+                var playerIndicators = __instance.playerIndicators;
+                var pinpointIndicators = __instance.pinpointIndicators;
+                if (playerIndicators == null || pinpointIndicators == null)
+                    return false;
+
+                int count = Math.Min(slots.Length, Math.Min(playerIndicators.Count, pinpointIndicators.Count));
+                for (int i = 0; i < count; i++)
+                {
+                    PlayerRef playerRef = slots[i];
+                    MapPlayerImage playerImg = playerIndicators[i];
+                    PinpointMapIcon pinIcon = pinpointIndicators[i];
+
+                    if (playerRef != PlayerRef.None)
+                    {
+                        string playerName = OverlandSessionPlayers.Instance.GetPlayerName(playerRef);
+                        bool ownsSupporter = OverlandSessionPlayers.Instance.OwnsSupporterEdition(playerRef);
+                        bool isDev = OverlandSessionPlayers.Instance.IsDevTeamMember(playerRef);
+                        Color playerColor = UIManager.GetPlayerColor(playerRef);
+
+                        if (playerImg != null)
+                        {
+                            playerImg.SetPlayerName(playerName);
+                            playerImg.SetPlayerBadges(ownsSupporter, isDev);
+                            playerImg.ShowPlayerName(!string.IsNullOrEmpty(playerName));
+                            playerImg.SetInnerColor(playerColor);
+                            playerImg.SetActive(true);
+                        }
+
+                        if (pinIcon != null)
+                        {
+                            pinIcon.SetColor(playerColor);
+                            pinIcon.SetLabelText(playerName);
+                        }
+                    }
+                    else
+                    {
+                        if (playerImg != null)
+                        {
+                            playerImg.SetActive(false);
+                        }
+                    }
+                }
+
+                return false; // Skip vanilla 4-player loop
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Error($"[ExpandedLobbies] Error in MapView.SetupPlayerNames patch: {ex}");
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Updates MapView player position & rotation indicators every frame for up to 16 players.
+    /// </summary>
+    [HarmonyPatch(typeof(MapView), nameof(MapView.UpdatePlayerIndicators))]
+    public static class MapView_UpdatePlayerIndicators_Patch
+    {
+        public static bool Prefix(MapView __instance)
+        {
+            try
+            {
+                if (__instance == null || OverlandSessionPlayers.Instance == null || OverlandSessionPlayers.Instance.Object == null)
+                    return false;
+
+                var runner = OverlandNetworkRunner.Instance;
+                if (runner == null)
+                    return false;
+
+                ExpandedPlayerHelper.EnsureExpandedMapIndicators(__instance);
+
+                PlayerRef[] slots = ExpandedPlayerHelper.GetOrderedPlayerSlots();
+                var playerIndicators = __instance.playerIndicators;
+                if (playerIndicators == null)
+                    return false;
+
+                int count = Math.Min(slots.Length, playerIndicators.Count);
+                for (int i = 0; i < count; i++)
+                {
+                    PlayerRef playerRef = slots[i];
+                    MapPlayerImage indicator = playerIndicators[i];
+                    if (indicator == null)
+                        continue;
+
+                    if (playerRef != PlayerRef.None &&
+                        OverlandSessionPlayers.Instance.SpawnedInMap(playerRef) &&
+                        runner.GetPlayerPositionAndRotation(playerRef, out Vector3 pos, out Quaternion rot))
+                    {
+                        indicator.SetActive(true);
+                        if (indicator.RotatingParent != null)
+                        {
+                            indicator.RotatingParent.rotation = Quaternion.Euler(0f, 0f, -rot.eulerAngles.y);
+                        }
+                        if (indicator.MovingParent != null)
+                        {
+                            indicator.MovingParent.anchoredPosition = __instance.WorldToUIPosition(pos);
+                        }
+                    }
+                    else
+                    {
+                        indicator.SetActive(false);
+                    }
+                }
+
+                return false; // Skip vanilla 4-player loop
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Error($"[ExpandedLobbies] Error in MapView.UpdatePlayerIndicators patch: {ex}");
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Updates MapView player name zoom scale for up to 16 players.
+    /// </summary>
+    [HarmonyPatch(typeof(MapView), nameof(MapView.UpdatePlayersNameZoom))]
+    public static class MapView_UpdatePlayersNameZoom_Patch
+    {
+        public static bool Prefix(MapView __instance, float currentZoom)
+        {
+            try
+            {
+                if (__instance == null || OverlandSessionPlayers.Instance == null || OverlandSessionPlayers.Instance.Object == null)
+                    return false;
+
+                ExpandedPlayerHelper.EnsureExpandedMapIndicators(__instance);
+
+                PlayerRef[] slots = ExpandedPlayerHelper.GetOrderedPlayerSlots();
+                var playerIndicators = __instance.playerIndicators;
+                if (playerIndicators == null)
+                    return false;
+
+                Vector3 scale = Vector3.one * (0.7f / currentZoom);
+                int count = Math.Min(slots.Length, playerIndicators.Count);
+                for (int i = 0; i < count; i++)
+                {
+                    if (slots[i] != PlayerRef.None && playerIndicators[i] != null)
+                    {
+                        playerIndicators[i].SetPlayerNameScale(scale);
+                    }
+                }
+
+                return false; // Skip vanilla 4-player loop
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Error($"[ExpandedLobbies] Error in MapView.UpdatePlayersNameZoom patch: {ex}");
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Updates MapView pinpoint (ping) icons for up to 16 players.
+    /// </summary>
+    [HarmonyPatch(typeof(MapView), nameof(MapView.UpdatePlayersPinpoints))]
+    public static class MapView_UpdatePlayersPinpoints_Patch
+    {
+        public static bool Prefix(MapView __instance)
+        {
+            try
+            {
+                if (__instance == null || OverlandSessionPlayers.Instance == null || OverlandSessionPlayers.Instance.Object == null)
+                    return false;
+
+                ExpandedPlayerHelper.EnsureExpandedMapIndicators(__instance);
+                __instance.SetupPlayerNames();
+
+                PlayerRef[] slots = ExpandedPlayerHelper.GetOrderedPlayerSlots();
+                var rectTransforms = __instance.pinpointIndicatorsRectTransforms;
+                if (rectTransforms == null)
+                    return false;
+
+                int count = Math.Min(slots.Length, rectTransforms.Count);
+                for (int i = 0; i < count; i++)
+                {
+                    __instance.UpdatePlayerPinpoint(slots[i], i);
+                }
+
+                return false; // Skip vanilla 4-player loop
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Error($"[ExpandedLobbies] Error in MapView.UpdatePlayersPinpoints patch: {ex}");
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Fixes MapView.IsPlayerPinpoint for 5th-16th players so clicking on their own pinpoint removes it.
+    /// </summary>
+    [HarmonyPatch(typeof(MapView), nameof(MapView.IsPlayerPinpoint))]
+    public static class MapView_IsPlayerPinpoint_Patch
+    {
+        public static bool Prefix(MapView __instance, PlayerRef playerRef, PinpointMapIcon pinpointIcon, ref bool __result)
+        {
+            try
+            {
+                if (__instance == null || pinpointIcon == null || playerRef == PlayerRef.None)
+                {
+                    __result = false;
+                    return false;
+                }
+
+                ExpandedPlayerHelper.EnsureExpandedMapIndicators(__instance);
+
+                int slotIdx = ExpandedPlayerHelper.GetPlayerSlotIndex(playerRef);
+                var pinpointIndicators = __instance.pinpointIndicators;
+                int iconIdx = pinpointIndicators != null ? pinpointIndicators.IndexOf(pinpointIcon) : -1;
+
+                __result = (slotIdx >= 0 && slotIdx == iconIdx);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Error($"[ExpandedLobbies] Error in MapView.IsPlayerPinpoint patch: {ex}");
+                __result = false;
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Ensures 5th-16th players' cars also appear on the HUD Compass bar.
+    /// </summary>
+    [HarmonyPatch(typeof(CompassController), nameof(CompassController.UpdateOtherCarsCompassIcon))]
+    public static class CompassController_UpdateOtherCarsCompassIcon_Patch
+    {
+        public static void Postfix(CompassController __instance)
+        {
+            try
+            {
+                if (__instance == null || OverlandSessionPlayers.Instance == null || OverlandSessionPlayers.Instance.Object == null)
+                    return;
+
+                var runner = OverlandNetworkRunner.Instance;
+                if (runner == null || runner.NetworkRunner == null)
+                    return;
+
+                var trackedCars = __instance.trackedCars;
+                if (trackedCars == null)
+                    return;
+
+                PlayerRef[] slots = ExpandedPlayerHelper.GetOrderedPlayerSlots();
+                PlayerRef localPlayer = OverlandNetworkRunner.LocalPlayerRef;
+
+                // Slots 0..3 are handled by vanilla UpdateOtherCarsCompassIcon; check slots 4..15
+                for (int i = 4; i < slots.Length; i++)
+                {
+                    PlayerRef playerRef = slots[i];
+                    if (playerRef == PlayerRef.None || playerRef == localPlayer)
+                        continue;
+
+                    if (!OverlandSessionPlayers.Instance.SpawnedInMap(playerRef))
+                        continue;
+
+                    if (!runner.NetworkRunner.TryGetPlayerObject(playerRef, out NetworkObject playerObj) || playerObj == null)
+                        continue;
+
+                    Transform targetTransform = playerObj.transform;
+                    if (targetTransform == null)
+                        continue;
+
+                    bool alreadyTracked = false;
+                    for (int j = 0; j < trackedCars.Count; j++)
+                    {
+                        CompassIcon existing = trackedCars[j];
+                        if (existing != null && existing.Target == targetTransform)
+                        {
+                            alreadyTracked = true;
+                            break;
+                        }
+                    }
+
+                    if (alreadyTracked)
+                        continue;
+
+                    // Obtain car compass sprite from an existing tracked car if available
+                    Sprite carSprite = null;
+                    for (int j = 0; j < trackedCars.Count; j++)
+                    {
+                        if (trackedCars[j]?.image?.sprite != null)
+                        {
+                            carSprite = trackedCars[j].image.sprite;
+                            break;
+                        }
+                    }
+
+                    if (carSprite != null)
+                    {
+                        Color playerColor = UIManager.GetPlayerColor(playerRef);
+                        CompassIcon newIcon = __instance.RegisterPersistentIcon(
+                            targetTransform,
+                            carSprite,
+                            playerColor,
+                            Color.clear,
+                            CompassIcon.Properties.None);
+
+                        if (newIcon != null)
+                        {
+                            newIcon.SetProperties((CompassIcon.Properties)3); // HasPriority | SkipCulling
+                            trackedCars.Add(newIcon);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Error($"[ExpandedLobbies] Error in CompassController.UpdateOtherCarsCompassIcon patch: {ex}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// On the Host, MapNetworkManager.PlayerRefToPinpointPosition has a weaved prime capacity of 7 (max 6 simultaneous pinpoints).
+    /// If 6 pinpoints are already active and a 7th player places a pinpoint, remove the oldest pinpoint first so insertion succeeds.
+    /// </summary>
+    [HarmonyPatch(typeof(MapNetworkManager), nameof(MapNetworkManager.RPC_InstantiatePinpoint))]
+    public static class MapNetworkManager_RPC_InstantiatePinpoint_Patch
+    {
+        public static void Prefix(MapNetworkManager __instance, PlayerRef playerRef)
+        {
+            try
+            {
+                if (__instance == null || __instance.Object == null || !__instance.HasStateAuthority)
+                    return;
+
+                var posDict = __instance.PlayerRefToPinpointPosition;
+                if (posDict.Count >= 6 && !posDict.ContainsKey(playerRef))
+                {
+                    PlayerRef[] slots = ExpandedPlayerHelper.GetOrderedPlayerSlots();
+                    for (int i = 0; i < slots.Length; i++)
+                    {
+                        PlayerRef candidate = slots[i];
+                        if (candidate != PlayerRef.None && candidate != playerRef && posDict.ContainsKey(candidate))
+                        {
+                            __instance.RPC_DestroyPinpoint(candidate);
+                            break;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning($"[ExpandedLobbies] Notice in RPC_InstantiatePinpoint prefix: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Guards OverlandSessionPlayers.AddPlayer against IndexOutOfRangeException when 5+ players connect
+    /// (since OrderedPlayerRefs and PlayerColors have fixed capacity 4), and ensures RPC_ShowPlayerJoinedNotification
+    /// and RPC_ConnectedPlayer are still invoked for 5th-16th players!
     /// </summary>
     [HarmonyPatch(typeof(OverlandSessionPlayers), nameof(OverlandSessionPlayers.AddPlayer))]
     public static class OverlandSessionPlayers_AddPlayer_Patch
     {
+        public static void Prefix(PlayerRef playerRef, string runtimePlayerPlayerName)
+        {
+            if (playerRef != PlayerRef.None && !string.IsNullOrEmpty(runtimePlayerPlayerName))
+            {
+                ExpandedPlayerHelper.CachedPlayerNames[playerRef.RawEncoded] = runtimePlayerPlayerName;
+            }
+        }
+
         [HarmonyFinalizer]
-        public static Exception Finalizer(Exception __exception, PlayerRef playerRef, string runtimePlayerPlayerName)
+        public static Exception Finalizer(Exception __exception, OverlandSessionPlayers __instance, PlayerRef playerRef, string runtimePlayerPlayerName)
         {
             if (__exception != null)
             {
-                MelonLogger.Warning($"[ExpandedLobbies] Guarded AddPlayer for {runtimePlayerPlayerName} (ID: {playerRef.RawEncoded}): {__exception.GetType().Name} - {__exception.Message}");
-                return null; // Suppress exception
+                MelonLogger.Msg($"[ExpandedLobbies] Completing AddPlayer for 5th+ player '{runtimePlayerPlayerName}' (ID: {playerRef.RawEncoded}).");
+                try
+                {
+                    if (__instance != null && __instance.Object != null)
+                    {
+                        __instance.RPC_ShowPlayerJoinedNotification(playerRef);
+                        __instance.RPC_ConnectedPlayer(playerRef);
+                    }
+                }
+                catch (Exception innerEx)
+                {
+                    MelonLogger.Warning($"[ExpandedLobbies] Notice during post-AddPlayer RPCs: {innerEx.Message}");
+                }
+                return null; // Suppress IndexOutOfRangeException from OrderedPlayerRefs[-1]
             }
             return null;
         }
@@ -395,11 +1090,20 @@ namespace OverTheHillExpandedLobbies
     }
 
     /// <summary>
-    /// Guards RPC_ConnectedPlayer against unhandled network state exceptions.
+    /// Guards RPC_ConnectedPlayer and triggers PlayerDataUpdated so MapView refreshes player names/icons for 5th+ players.
     /// </summary>
     [HarmonyPatch(typeof(OverlandSessionPlayers), nameof(OverlandSessionPlayers.RPC_ConnectedPlayer))]
     public static class OverlandSessionPlayers_RPC_ConnectedPlayer_Patch
     {
+        public static void Postfix()
+        {
+            try
+            {
+                OverlandSessionPlayers.InvokePlayerDataUpdated();
+            }
+            catch { }
+        }
+
         [HarmonyFinalizer]
         public static Exception Finalizer(Exception __exception, PlayerRef playerRef)
         {
@@ -413,18 +1117,87 @@ namespace OverTheHillExpandedLobbies
     }
 
     /// <summary>
-    /// Guards GetPlayerName to provide a fallback name if dictionary lookup fails for extra players.
+    /// Triggers PlayerDataUpdated when any player disconnects so MapView refreshes icons for 5th+ players.
+    /// </summary>
+    [HarmonyPatch(typeof(OverlandSessionPlayers), nameof(OverlandSessionPlayers.RPC_DisconnectedPlayer))]
+    public static class OverlandSessionPlayers_RPC_DisconnectedPlayer_Patch
+    {
+        public static void Postfix()
+        {
+            try
+            {
+                OverlandSessionPlayers.InvokePlayerDataUpdated();
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>
+    /// Ensures GetPlayerCount counts all connected players (up to 16) rather than only the 4 in OrderedPlayerRefs.
+    /// </summary>
+    [HarmonyPatch(typeof(OverlandSessionPlayers), nameof(OverlandSessionPlayers.GetPlayerCount))]
+    public static class OverlandSessionPlayers_GetPlayerCount_Patch
+    {
+        public static void Postfix(ref int __result)
+        {
+            try
+            {
+                PlayerRef[] slots = ExpandedPlayerHelper.GetOrderedPlayerSlots();
+                int count = 0;
+                for (int i = 0; i < slots.Length; i++)
+                {
+                    if (slots[i] != PlayerRef.None)
+                        count++;
+                }
+                if (count > __result)
+                {
+                    __result = count;
+                }
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>
+    /// Provides fallback player names if PlayerRefToNameDictionary is full (7th+ players) or lookup fails.
     /// </summary>
     [HarmonyPatch(typeof(OverlandSessionPlayers), nameof(OverlandSessionPlayers.GetPlayerName))]
     public static class OverlandSessionPlayers_GetPlayerName_Patch
     {
+        public static void Postfix(PlayerRef playerRef, ref string __result)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(__result) && playerRef != PlayerRef.None)
+                {
+                    if (ExpandedPlayerHelper.CachedPlayerNames.TryGetValue(playerRef.RawEncoded, out string cached) && !string.IsNullOrEmpty(cached))
+                    {
+                        __result = cached;
+                        return;
+                    }
+
+                    var runner = OverlandNetworkRunner.Instance;
+                    if (runner?.spawnedCharactersInfo != null &&
+                        runner.spawnedCharactersInfo.TryGetValue(playerRef, out RuntimePlayer rtPlayer) &&
+                        rtPlayer != null && !string.IsNullOrEmpty(rtPlayer.PlayerName))
+                    {
+                        __result = rtPlayer.PlayerName;
+                        return;
+                    }
+
+                    __result = $"Player {playerRef.PlayerId + 1}";
+                }
+            }
+            catch { }
+        }
+
         [HarmonyFinalizer]
         public static Exception Finalizer(Exception __exception, PlayerRef playerRef, ref string __result)
         {
             if (__exception != null)
             {
-                __result = $"Player_{playerRef.RawEncoded}";
-                return null; // Suppress exception and provide fallback
+                __result = $"Player {playerRef.PlayerId + 1}";
+                return null;
             }
             return null;
         }
