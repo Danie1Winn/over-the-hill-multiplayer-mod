@@ -1,11 +1,12 @@
 using System;
+using System.Runtime.InteropServices;
 using MelonLoader;
 using HarmonyLib;
 using UnityEngine;
 using Il2Cpp;
 using Il2CppFusion;
 
-[assembly: MelonInfo(typeof(OverTheHillExpandedLobbies.ExpandedLobbiesMod), "Expanded Lobbies", "1.0.2", "Daniel Winn")]
+[assembly: MelonInfo(typeof(OverTheHillExpandedLobbies.ExpandedLobbiesMod), "Expanded Lobbies", "1.0.3", "Daniel Winn")]
 [assembly: MelonGame("Funselektor", "over the hill")]
 
 namespace OverTheHillExpandedLobbies
@@ -15,9 +16,195 @@ namespace OverTheHillExpandedLobbies
         public override void OnInitializeMelon()
         {
             LoggerInstance.Msg("==========================================================");
-            LoggerInstance.Msg(" Over The Hill: Expanded Lobbies Mod Loaded! (v1.0.2)     ");
+            LoggerInstance.Msg(" Over The Hill: Expanded Lobbies Mod Loaded! (v1.0.3)     ");
             LoggerInstance.Msg(" Player limit selectable from 2 to 16 in single steps.    ");
             LoggerInstance.Msg("==========================================================");
+
+            NativePatcher.ApplyPatches();
+        }
+    }
+
+    /// <summary>
+    /// Direct native binary patching in GameAssembly.dll.
+    /// Overcomes IL2CPP struct pass-by-value limitations and directly patches:
+    /// 1. Host StartGameAsync: changes vanilla clamp min(MaxPlayers, 4) to min(MaxPlayers, 16).
+    /// 2. Client JoinSession: NOPs the conditional jump that shows the "Game Is Full" popup.
+    /// </summary>
+    internal static class NativePatcher
+    {
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
+
+        private const uint PAGE_EXECUTE_READWRITE = 0x40;
+
+        public static void ApplyPatches()
+        {
+            try
+            {
+                IntPtr hModule = GetModuleHandle("GameAssembly.dll");
+                if (hModule == IntPtr.Zero)
+                {
+                    MelonLogger.Error("[ExpandedLobbies] Failed to obtain GameAssembly.dll handle.");
+                    return;
+                }
+
+                // 1. Host StartGameAsync MaxPlayers Clamp
+                // Target RVA: 0xCFF269
+                // Signature (13 bytes): 41 BF 04 00 00 00 41 3B F7 41 0F 4D F7
+                // Instructions: mov r15d, 4; cmp esi, r15d; cmovge esi, r15d
+                // Patch: Change 0x04 at RVA 0xCFF26B to 0x10 (16), clamping to 16 instead of 4.
+                byte[] hostSig = new byte[] { 0x41, 0xBF, 0x04, 0x00, 0x00, 0x00, 0x41, 0x3B, 0xF7, 0x41, 0x0F, 0x4D, 0xF7 };
+                IntPtr hostAddr = IntPtr.Add(hModule, 0xCFF269);
+                if (CheckSignature(hostAddr, hostSig))
+                {
+                    PatchByte(IntPtr.Add(hModule, 0xCFF26B), 0x10, "Host MaxPlayers clamp (RVA 0xCFF26B: 4 -> 16)");
+                }
+                else
+                {
+                    IntPtr scanned = FindPattern(hModule, hostSig);
+                    if (scanned != IntPtr.Zero)
+                    {
+                        PatchByte(IntPtr.Add(scanned, 2), 0x10, "Host MaxPlayers clamp (Pattern Scan: 4 -> 16)");
+                    }
+                    else
+                    {
+                        MelonLogger.Msg("[ExpandedLobbies] Host MaxPlayers clamp already patched or signature not found.");
+                    }
+                }
+
+                // 2. Client JoinSession 'Game Is Full' Rejection Bypass
+                // Target RVA: 0x9A73FE
+                // Signature (9 bytes): 39 4A 28 0F 8D 8C 05 00 00
+                // Instructions: cmp [rdx+0x28], ecx; jge 0x1809a7993
+                // Patch: Replace 6-byte jump (0F 8D 8C 05 00 00) at RVA 0x9A7401 with NOPs (0x90).
+                byte[] clientSig = new byte[] { 0x39, 0x4A, 0x28, 0x0F, 0x8D, 0x8C, 0x05, 0x00, 0x00 };
+                IntPtr clientAddr = IntPtr.Add(hModule, 0x9A73FE);
+                byte[] nops = new byte[] { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                if (CheckSignature(clientAddr, clientSig))
+                {
+                    PatchBytes(IntPtr.Add(hModule, 0x9A7401), nops, "Client JoinSession rejection bypass (RVA 0x9A7401)");
+                }
+                else
+                {
+                    byte[] clientSigShort = new byte[] { 0x39, 0x4A, 0x28, 0x0F, 0x8D };
+                    IntPtr scanned = FindPattern(hModule, clientSigShort);
+                    if (scanned != IntPtr.Zero)
+                    {
+                        PatchBytes(IntPtr.Add(scanned, 3), nops, "Client JoinSession rejection bypass (Pattern Scan)");
+                    }
+                    else
+                    {
+                        MelonLogger.Msg("[ExpandedLobbies] Client JoinSession check already patched or signature not found.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Error($"[ExpandedLobbies] Error in NativePatcher: {ex}");
+            }
+        }
+
+        private static unsafe bool CheckSignature(IntPtr addr, byte[] sig)
+        {
+            try
+            {
+                byte* ptr = (byte*)addr;
+                for (int i = 0; i < sig.Length; i++)
+                {
+                    if (ptr[i] != sig[i]) return false;
+                }
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static unsafe void PatchByte(IntPtr addr, byte newVal, string desc)
+        {
+            if (VirtualProtect(addr, (UIntPtr)1, PAGE_EXECUTE_READWRITE, out uint oldProtect))
+            {
+                *(byte*)addr = newVal;
+                VirtualProtect(addr, (UIntPtr)1, oldProtect, out _);
+                MelonLogger.Msg($"[ExpandedLobbies] Native patch applied: {desc}");
+            }
+            else
+            {
+                MelonLogger.Error($"[ExpandedLobbies] VirtualProtect failed for {desc}");
+            }
+        }
+
+        private static unsafe void PatchBytes(IntPtr addr, byte[] newBytes, string desc)
+        {
+            if (VirtualProtect(addr, (UIntPtr)newBytes.Length, PAGE_EXECUTE_READWRITE, out uint oldProtect))
+            {
+                byte* ptr = (byte*)addr;
+                for (int i = 0; i < newBytes.Length; i++)
+                {
+                    ptr[i] = newBytes[i];
+                }
+                VirtualProtect(addr, (UIntPtr)newBytes.Length, oldProtect, out _);
+                MelonLogger.Msg($"[ExpandedLobbies] Native patch applied: {desc}");
+            }
+            else
+            {
+                MelonLogger.Error($"[ExpandedLobbies] VirtualProtect failed for {desc}");
+            }
+        }
+
+        private static unsafe IntPtr FindPattern(IntPtr hModule, byte[] pattern)
+        {
+            try
+            {
+                byte* basePtr = (byte*)hModule;
+                int peOffset = *(int*)(basePtr + 0x3C);
+                short numSections = *(short*)(basePtr + peOffset + 6);
+                short optHdrSize = *(short*)(basePtr + peOffset + 20);
+                byte* sectPtr = basePtr + peOffset + 24 + optHdrSize;
+
+                // Search inside executable sections (e.g. .text and il2cpp)
+                for (int s = 0; s < numSections; s++)
+                {
+                    byte* sec = sectPtr + (s * 40);
+                    uint virtSize = *(uint*)(sec + 8);
+                    uint virtAddr = *(uint*)(sec + 12);
+                    uint characteristics = *(uint*)(sec + 36);
+
+                    // Check for IMAGE_SCN_MEM_EXECUTE (0x20000000)
+                    if ((characteristics & 0x20000000) != 0 && virtSize > pattern.Length)
+                    {
+                        byte* start = basePtr + virtAddr;
+                        byte* end = start + virtSize - pattern.Length;
+                        int patLen = pattern.Length;
+
+                        for (byte* curr = start; curr <= end; curr++)
+                        {
+                            bool match = true;
+                            for (int i = 0; i < patLen; i++)
+                            {
+                                if (curr[i] != pattern[i])
+                                {
+                                    match = false;
+                                    break;
+                                }
+                            }
+                            if (match)
+                            {
+                                return (IntPtr)curr;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Error($"[ExpandedLobbies] Pattern scan exception: {ex.Message}");
+            }
+            return IntPtr.Zero;
         }
     }
 
@@ -114,38 +301,7 @@ namespace OverTheHillExpandedLobbies
     }
 
     /// <summary>
-    /// Fixes the hardcoded vanilla clamp min(MaxPlayers, 4) in StartGameArgs.
-    /// When the host creates a session, this overrides StartGameArgs.PlayerCount with the
-    /// chosen MaxPlayers value so Photon Fusion actually hosts an expanded room.
-    /// </summary>
-    [HarmonyPatch(typeof(NetworkRunner), nameof(NetworkRunner.StartGame))]
-    public static class NetworkRunner_StartGame_Patch
-    {
-        public static void Prefix(NetworkRunner __instance, ref StartGameArgs args)
-        {
-            try
-            {
-                if (OverlandNetworkRunner.Instance != null && OverlandNetworkRunner.Instance.GameSetupContext != null)
-                {
-                    int maxPlayers = OverlandNetworkRunner.Instance.GameSetupContext.MaxPlayers;
-                    if (maxPlayers > 4)
-                    {
-                        MelonLogger.Msg($"[ExpandedLobbies] Host creating room: Overriding Photon StartGameArgs.PlayerCount to {maxPlayers}!");
-                        args.PlayerCount = new Il2CppSystem.Nullable<int>(maxPlayers);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                MelonLogger.Error($"[ExpandedLobbies] Error in NetworkRunner.StartGame patch: {ex}");
-            }
-        }
-    }
-
-    /// <summary>
-    /// Fixes the client-side 'Game Is Full' popup in StateServerBrowser.JoinSession.
-    /// Vanilla compares session.FusionSessionInfo.PlayerCount >= session.FusionSessionInfo.MaxPlayers.
-    /// This ensures clients never block joining when connecting to expanded lobbies.
+    /// Client-side logging and backup capacity assignment when connecting to sessions.
     /// </summary>
     [HarmonyPatch(typeof(StateServerBrowser), nameof(StateServerBrowser.JoinSession))]
     public static class StateServerBrowser_JoinSession_Patch
@@ -154,12 +310,14 @@ namespace OverTheHillExpandedLobbies
         {
             try
             {
-                if (sessionToJoin?.FusionSessionInfo != null)
+                string roomName = sessionToJoin?.RoomDisplayName ?? "Unknown";
+                int currentPlayers = sessionToJoin?.FusionSessionInfo?.PlayerCount ?? -1;
+                int maxPlayers = sessionToJoin?.FusionSessionInfo?.MaxPlayers ?? -1;
+                MelonLogger.Msg($"[ExpandedLobbies] Joining session '{roomName}' (Players: {currentPlayers}/{maxPlayers}, ByCode: {joiningByCode})");
+
+                if (sessionToJoin?.FusionSessionInfo != null && sessionToJoin.FusionSessionInfo.MaxPlayers < 16)
                 {
-                    if (sessionToJoin.FusionSessionInfo.MaxPlayers < 16)
-                    {
-                        sessionToJoin.FusionSessionInfo.MaxPlayers = 16;
-                    }
+                    sessionToJoin.FusionSessionInfo.MaxPlayers = 16;
                 }
             }
             catch (Exception ex)
